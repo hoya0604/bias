@@ -1,0 +1,2002 @@
+---
+title: "Bias analysis"
+author: "YD Hwang and MY Jung"
+date: "10/24/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(caret)
+library(tidyverse)
+library(data.table)
+library(stringr)
+library(extrafont)
+library(stargazer)
+library(reporttools)
+library(AER)
+library(rockchalk)
+library(pROC)
+library(Hmisc)
+library(caret)
+
+theme_set(theme_gray(base_family = "NanumGothic"))
+par(family = "NanumGothic")
+```
+
+### loading
+```{r loading}
+appl <- fread("../data/UTF-8/utf8.csv", encoding = "UTF-8")
+appl <- appl %>% mutate_if(is.character, tolower)
+```
+
+### Previous salary
+How much was prev salary? If missing, it means they have 0 exp.
+
+```{r}
+max_previous <- appl %>% 
+  select(id, contains("exp")) %>% 
+  select(id, contains("wage")) %>% 
+  gather(wage, number, -id) %>% 
+  group_by(id) %>% 
+  summarise(max_prev_wage = max(number, na.rm = TRUE)) %>% 
+  ungroup %>% as_tibble  
+max_previous <- max_previous %>% mutate(max_prev_wage = as.numeric(as.character.numeric_version(max_prev_wage))) %>% 
+  mutate(max_prev_wage = ifelse(is.na(max_prev_wage), NA, max_prev_wage))
+
+
+```
+
+### Check if there's any intern experience or study-abroad
+
+```{r experience}
+intern_exp <- appl %>% select(id, contains("intern")) %>% gather(intern, at, -id) %>% group_by(id) %>% 
+  summarise(intern_exp = any(at != "")) %>% ungroup %>% as_tibble
+
+indiv_data <- left_join(max_previous, intern_exp)
+abroad_exp <- appl %>% select(id, contains("abroad")) %>% gather(abroad, type, -id) %>% group_by(id) %>% 
+  summarise(abroad_exp_profe = any(type == "유학" | type == "어학연수" | type == "교환학생")) %>% 
+  ungroup %>% as_tibble
+
+indiv_data <- left_join(max_previous, intern_exp)
+indiv_data <- left_join(indiv_data, abroad_exp)
+
+```
+
+### Award and certificate
+```{r}
+# checking if there's any award
+award_exp <- appl %>% select(id, contains("award")) %>% gather(award, type, -id) %>% group_by(id) %>% 
+  summarise(award_exp = any(type != "")) %>% ungroup %>% as_tibble
+indiv_data <- left_join(indiv_data, award_exp)
+
+# checking how many certificates
+certificate_exp <- appl %>% select(id, contains("certi")) %>% gather(certificate, type, -id) %>% 
+  group_by(id) %>% summarise(certificate = sum(type != "")) %>% ungroup %>% as_tibble
+indiv_data <- left_join(indiv_data, certificate_exp)
+```
+
+### Create the age part
+```{r age}
+birth <- appl %>% select(id, birthday) %>% 
+  mutate(year = str_sub(birthday, 1, 4), 
+         month = str_sub(birthday, 5, 6), 
+         day = str_sub(birthday, 7, 8)) %>% 
+  unite(birthday, c("year", "month", "day"), sep = "-") %>% 
+  mutate(birthday = parse_date(birthday))
+
+appl_date <- appl %>% select(id, date) %>% mutate(year = str_sub(date, 1, 4), month = str_sub(date, 
+                                                                                              5, 6), day = str_sub(date, 7, 8)) %>% unite(date, c("year", "month", "day"), sep = "-") %>% 
+  mutate(date = parse_date(date))
+
+birth_data <- left_join(appl_date, birth) %>% mutate(age = date - birthday) %>% mutate(age = round(as.numeric(age)/365))
+
+indiv_data <- left_join(indiv_data, birth_data)
+```
+
+### GPA processing
+
+```{r GPA-individual fix}
+##Here, i make a new var. "univ_maxgpa_edit" by fixing some errors in original univ_maxgpa
+#MY: For the applicants who have missing value for univ_maxgpa, MY enter 4.5 
+appl <- appl %>% 
+  mutate(univ_maxgpa_edit = ifelse(is.na(univ_maxgpa),4.5,univ_maxgpa))
+
+#MY: univ_gpa는 4.5 혹은 4.3와 같은 format으로 입력되었으나, univ_maxgpa_edit의 경우 백분율(100)으로 입력된 경우는 maxgpa_edit으로 4.5로 통일하였습니다. 
+appl <- appl %>% 
+  mutate(univ_maxgpa_edit = 
+           ifelse((univ_gpa<=4.5)&(univ_maxgpa_edit>4.5), 4.5, 
+                                   univ_maxgpa_edit))
+#원본데이터의 Variable 설명
+
+#MY: 원본데이터에서 gpa1 ~ gpa9까지는 순서대로 1학기부터 9학기 까지의 학점을 의미합니다. 
+#MY: univ_maxgpa_edit은 최대 학점, 즉 각 대학의 gpa가 4.3, 4.5기반인지 백분율(100)기반인지 의미합니다.
+#MY: univ_gpa는 9학기의 평균 학점을 의미합니다. 
+
+#MY: 각 학기의 학점 (gpa1~gpa9)는 백분율 기반인데, max_gpa경우 4.3 or 4.5기반인 경우, 변경 필요합니다. 
+#(gpa1>4.5)&(univ_maxgpa_edit<=4.5) ~ 각 학기의 학점 중 대표적으로 gpa1이 4.5보다 큰, 즉 백분율 기반이지만, univ_maxgpa의 경우 4.5나 4.3기반 경우를 의미. 
+appl <- appl %>% mutate(univ_maxgpa_edit = ifelse((gpa1>4.5)&(univ_maxgpa_edit<=4.5), 100,univ_maxgpa_edit))
+
+##univ_maxgpa_edit finish##
+
+#(gpa1>4.5)&(univ_gpa<=4.5) ~ 각 학기의 학점 중 대표적으로 gpa1이 4.5보다 큰, 즉 백분율 기반이지만, univ_gpa의 경우 4.5나 4.3기반 경우를 의미. 그 경우, univ_gpa를 백분율 값으로 바꾸기.
+appl <- appl %>% mutate(univ_gpa = ifelse((gpa1>4.5)&(univ_gpa<=4.5), (univ_gpa/4.5) *100,univ_gpa))
+#9학기 성적 (=gpa9)가 잘못 입력된 경우 존재, gpa1~gpa8은 문제 없음.
+#gpa9가 100이상인 경우, 백분율 format도 아니고, 3.57이 357로 잘못 입려된 경우 처럼, 소수점이 빠진 4.3 format인 경우임.
+# 따라서 gpa9가 100을 넘으면 100으로 나누어 소수점을 만들어 줌. 
+appl <- appl %>% mutate(gpa9 = ifelse(gpa9>100, gpa9/100, gpa9))
+
+```
+
+
+### GPA processing
+
+```{r}
+school_yr_summary <- appl %>% select(id, contains("gpa"))
+school_yr_summary <- school_yr_summary %>% 
+  select(id, univ_gpa, univ_maxgpa_edit, 
+         which(str_detect(names(school_yr_summary), "[0123456789]"))) %>% 
+  gather(sem, gpa, -id, -univ_gpa, -univ_maxgpa_edit) %>% group_by(id) %>% 
+  summarise(how_long = sum(gpa != "", na.rm = TRUE), 
+            univ_maxgpa_edit = max(univ_maxgpa_edit), 
+            univ_gpa = max(univ_gpa), 
+            mean_gpa = univ_gpa/univ_maxgpa_edit, min_gpa = min(gpa, na.rm = TRUE)/univ_maxgpa_edit, 
+            max_gpa = max(gpa, na.rm = TRUE)/univ_maxgpa_edit)
+```
+
+
+```{r school year individual fix}
+indiv_data <- left_join(indiv_data, school_yr_summary)
+# MY: some applicants didn't enter gpa for each semester, them we can assign mean gpa for min and
+# max.
+# Show the case of applicants who have all missing values from gpa1 ~ gap9, and thus have infinite number of min_gpa and max_gpa
+wrong_min_gpa <- indiv_data %>% filter(is.infinite(min_gpa))
+wrong_min_gpa$min_gpa
+wrong_min_gpa$id
+
+indiv_data <- indiv_data %>% 
+  mutate(min_gpa = ifelse(is.infinite(min_gpa), mean_gpa, min_gpa))
+
+#Same for max_gpa
+wrong_max_gpa <- indiv_data %>% filter(is.infinite(max_gpa))
+wrong_max_gpa$max_gpa
+wrong_max_gpa$id
+
+indiv_data <- indiv_data %>% 
+  mutate(max_gpa = ifelse(is.infinite(max_gpa), mean_gpa, max_gpa))
+
+
+# some applicants make a mistake that they enter all zero for
+# each semester even though they enter univ_gpa correctly therefore, i assigned mean_gpa
+# for the applicants max_gpa < mean_gpa
+
+indiv_data <- indiv_data %>% mutate(max_gpa = ifelse(max_gpa < mean_gpa, mean_gpa, max_gpa))
+```
+
+```{r}
+indiv_data <- left_join(indiv_data, appl %>% select(id, accept))
+
+```
+
+```{r attaching misc info}
+misc <- appl %>% select(id, patriot, handi, basic, email_domain, work_type, univ_gradmajor, 
+                        univ_graduniv, edu_final, sex)
+indiv_data <- indiv_data <- left_join(indiv_data, misc)
+```
+
+## email domain processing 
+
+This chunk uses hand-made file. I need a description file for `email.csv` file. What is email_domain_edit? Also I don't think `hotmail.co.kr` or `hanmail.com` are correct naming.
+
+MY: `email_domain_edit` is the variable after correcting "spelling errors"" and ".com or .net errors"" in email_domain. `email_class` is the group variable, and i assigned minor addresses as etc.
+
+```{r email processing}
+indiv_data <- indiv_data %>% mutate(email_domain = ifelse(grepl("ac.", email_domain), "school", 
+                                                          email_domain)) %>% mutate(email_domain = ifelse(grepl("edu", email_domain), "school", email_domain)) %>% 
+  mutate(email_domain = ifelse(grepl("mail.utoronto.ca", email_domain), "school", email_domain)) %>% 
+  mutate(email_domain = ifelse(grepl("sfu", email_domain), "school", email_domain)) %>% mutate(email_domain = ifelse(grepl("ewha", email_domain), "school", email_domain))
+indiv_data$email_domain %>% unique
+
+# this is hand-made file. 
+
+email_matching_tbl <- fread("../data/UTF-8/email.csv")
+indiv_data <- left_join(indiv_data, email_matching_tbl) %>% 
+  select(-email_domain, -email_domain_edit)
+count(indiv_data,email_class)
+```
+
+```{r}
+
+indiv_data %>% summarise_all(n_distinct) 
+indiv_data <- indiv_data %>%mutate(wage_disc = cut(max_prev_wage, breaks = c(-Inf,                                                                               c(1000, 2000, 3000, 4000), Inf))) %>% mutate(wage_disc = as.character(wage_disc))
+indiv_data <- indiv_data %>% mutate(wage_disc = ifelse(is.na(wage_disc), "(--missing)", wage_disc))
+
+indiv_data <- indiv_data %>% mutate(max_prev_wage = ifelse(is.na(max_prev_wage),'Missing',max_prev_wage))
+
+count(indiv_data,wage_disc)
+
+# there are some missing gpas
+indiv_data %>% is.na %>% colMeans
+# apparently they're highschool/associate degree
+indiv_data %>% group_by(edu_final) %>% summarise(ms = sum(is.na(mean_gpa)))
+# zero non-college graduate got accepted regardless
+indiv_data %>% group_by(edu_final) %>% summarise(ms = sum(accept))
+# so let's exclude them for now
+indiv_data <- indiv_data %>% na.omit
+
+
+```
+
+
+### English score processing
+```{r English}
+# AL 979.5 IH 935.8 IM3 860.9 IM2 765.8 IM1 587.6 IL 396.3 c(396.3, 587.6, 765.8, 860.9,
+# 935.8, 979.5) 'al' 'im2' 'ih' 'il' 'im1' 'im3' 'nh' 'am' 'im' 'ah'
+english <- rep(NA, nrow(appl))
+toeic <- appl$toeic_score
+opic <- appl$opic_score
+english[!is.na(toeic)] <- toeic[!is.na(toeic)]
+for (k in seq_along(english)) {
+  toeic_k <- toeic[k]
+  opic_k <- opic[k]
+  if (is.na(toeic_k)) {
+    if (opic_k == "al") 
+      english[k] <- 980
+    if (opic_k == "ih") 
+      english[k] <- 940
+    if (opic_k == "im3") 
+      english[k] <- 870
+    if (opic_k == "im2") 
+      english[k] <- 770
+    if (opic_k == "im1") 
+      english[k] <- 590
+    if (opic_k == "il") 
+      english[k] <- 400
+    if (opic_k == "") 
+      english[k] <- NA
+  }
+}
+
+appl$english <- english
+
+english_tbl <- appl %>% select(id, patriot, handi, basic, email_domain, work_type, univ_gradmajor, 
+                               edu_final, sex, toeic_score, accept, english) %>% mutate(toeic_disc = cut(english, breaks = c(-Inf, 
+                                                                                                                             c(765.8, 860.9, 935.8, 979.5), Inf))) %>% mutate(toeic_disc = as.character(toeic_disc))
+english_tbl <- english_tbl %>% mutate(toeic_disc = ifelse(is.na(toeic_disc), "[0_missing", toeic_disc))
+
+
+
+```
+
+
+### Further processing
+
+This part is to take care of school class, major types, and so on. English score has some systematic missingness. 
+YD thinks there are some systematic pattern of missing in English. It may be the case where applicants are waived for English if they have some overseas experience (say, study abroard).
+```{r}
+indiv_data %>% group_by(email_class, sex) %>% summarise(accept_ratio = mean(accept)) %>% ggplot() + 
+  geom_bar(mapping = aes(x = email_class, y = accept_ratio, fill = sex), position = "dodge", 
+           stat = "identity") + coord_flip()
+
+indiv_data <- left_join(indiv_data, english_tbl)
+indiv_data <- indiv_data %>% mutate(toeic_disc = ifelse(is.na(toeic_disc), "Missing", toeic_disc))
+
+graduniv <- fread("../data/UTF-8/unique_univ_graduniv_utf8.csv", encoding = 'UTF-8') %>% 
+  mutate_all(.funs = function(x) ifelse(x == "", NA, x)) 
+
+# this is currently too fine. Think of better categorization (e.g., Engineering - Science - EconBiz - Humanities)
+gradmajor <- fread("../data/UTF-8/unique_univ_gradmajor_utf8.csv", encoding = 'UTF-8') %>% 
+  mutate_all(.funs = function(x) ifelse(x == "", NA, x)) 
+
+work_type <- fread("../data/UTF-8/unique_work_type_utf8.csv", encoding = 'UTF-8') %>% 
+  mutate_all(.funs = function(x) ifelse(x == "", NA, x))
+
+indiv_data <- indiv_data %>% 
+  left_join(graduniv) %>% 
+  left_join(gradmajor) %>% 
+  left_join(work_type) %>% 
+  select(-work_type, -univ_gradmajor,-univ_gradmajor_subclass, -univ_graduniv) %>% 
+  rename(univ_class = univ_graduniv_class) %>% 
+  rename(work_type = work_type_class) %>% 
+  rename(univ_major = univ_gradmajor_class) %>% 
+  mutate(univ_class = ifelse(is.na(univ_class), "그외", univ_class)) 
+count(indiv_data,work_type)
+# english discretize
+# YD thinks there are some systematic pattern of missing in English.
+# It may be the case where applicants are waived for English if they have some 
+# overseas experience (say, study abroard).
+indiv_data <- indiv_data %>% mutate(english_discrete = ntile(english, 4)) %>% 
+  mutate(english_discrete = ifelse(is.na(english_discrete), '(--missing)', english_discrete)) %>% 
+  mutate(english_discrete = as.factor(english_discrete)) 
+
+
+#univ_major_missing
+indiv_data <- indiv_data %>% mutate(univ_major=ifelse(is.na(univ_major),'missing',univ_major))
+#quarter
+indiv_data <- indiv_data %>% mutate(date =as.Date(date))
+indiv_data <- indiv_data %>% mutate(quarter = ifelse(year(date)==2015&month(date)<=5,'1st',ifelse(year(date)==2015&month(date)>5,'2nd',ifelse(year(date)==2016&month(date)<=5,'3rd','4th'))))
+count(indiv_data,quarter)
+
+#MY: 이화여대를 이중경외시 클래스에서 별도로 떼어냄
+
+appl_female_univ <- appl %>% filter(univ_name=='이화여자대학교')
+appl_female_univ <- appl_female_univ[,c(1,29)]
+
+indiv_data <- indiv_data %>% left_join(appl_female_univ)
+
+indiv_data <- indiv_data %>% mutate(univ_class2 = ifelse(is.na(univ_name),univ_class,'이화여대'))
+
+```
+
+```{r for distribution check}
+indiv_data <- indiv_data %>% mutate(uni_group = ifelse(univ_class=='설카포',1,ifelse(univ_class=='연고',2,ifelse(univ_class=='서성한',3,ifelse(univ_class=='해외대학(상위권)',4,ifelse(univ_class=='이중경외시',5,5))))))
+count(indiv_data,uni_group)
+
+indiv_data <- indiv_data %>% mutate(gpa_group = ifelse(mean_gpa<=0.89,30,ifelse(mean_gpa<=0.93,20,10)))
+count(indiv_data,gpa_group)
+
+indiv_data <- indiv_data %>% mutate(age_group = ifelse(age<=24,100,ifelse(age<=26,200,ifelse(age<=28,300,400))))
+count(indiv_data,age_group)
+
+indiv_data <- indiv_data %>% mutate(certificate_group = ifelse(certificate<=0,1000,2000))
+count(indiv_data,certificate_group)
+
+indiv_data <- indiv_data %>% mutate(sex_group = ifelse(sex=='남자',10000,20000))
+count(indiv_data,sex_group)
+
+indiv_data <- indiv_data %>% mutate(intern_group = ifelse(intern_exp==FALSE,100000,200000))
+count(indiv_data,intern_group)
+
+indiv_data <- indiv_data %>% mutate(belonged_group = uni_group+gpa_group+age_group+certificate_group+sex_group+intern_group)
+
+gru <- as.data.frame(count(indiv_data, belonged_group))
+write.csv(gru,"group_belonged.csv")
+
+
+```
+
+```{r visualization}
+## visualization for different acceptance rate
+indiv_data <- indiv_data %>% 
+  mutate(UniversityClass= ifelse(univ_class2 =='교대'|univ_class2 =='과기원_카이스트제외'|
+                                   univ_class2 =='사관학교'|univ_class2 =='의대','그외',univ_class2))
+count(indiv_data,univ_class2)
+
+indiv_data <- indiv_data %>% 
+  mutate(UniversityClass= ifelse(UniversityClass=='설카포','Domestic top 3', 
+                                 ifelse(UniversityClass=='연고','Domestic top 4-5', 
+                                        ifelse(UniversityClass=='서성한','Domestic top 6-8',
+                                               ifelse(UniversityClass == '이중경외시','Domestic top 10-13',
+                                                      ifelse(UniversityClass=='지방거점국립대','Domestic top 14-22',
+                                                             ifelse(UniversityClass=='해외대학(상위권)','International high',
+                                                                    ifelse(UniversityClass=='해외대학(중하위권)','International mid-low',
+                                                                           ifelse(UniversityClass =='이화여대','Domestic top 9 (female univ.)', 'etc')))))))))
+count(indiv_data,UniversityClass)
+
+indiv_data$UniversityClass <- factor(indiv_data$UniversityClass, 
+                                     levels = c('Domestic top 3', 
+                                                'Domestic top 4-5', 
+                                                'Domestic top 6-8', 
+                                                'Domestic top 9 (female univ.)',
+                                                'Domestic top 10-13',
+                                                'Domestic top 14-22',
+                                                'International high',
+                                                'International mid-low', 'etc'))
+
+indiv_data <- indiv_data %>% mutate(sex = ifelse(sex=='남자', 'Male', 'Female'))
+count(indiv_data,sex)
+
+gender_dist <- 
+  indiv_data %>% group_by(sex, UniversityClass) %>% 
+  summarise(NumberOFapplicants = n()) %>% rename(Gender = sex)
+
+gender_sum <- gender_dist %>% group_by(Gender) %>% 
+  summarise(N = sum(NumberOFapplicants)) # N is the # of total applicants for each gender
+
+gender_dist <- gender_dist %>% 
+  left_join(gender_sum) %>% 
+  mutate(Gender_Dist.of_UniversityClass = 100*NumberOFapplicants / N) 
+
+gender_dist %>% 
+  ggplot() + geom_bar(aes(x = UniversityClass, fill = Gender, y = Gender_Dist.of_UniversityClass ), 
+                                   position = "dodge", stat = "identity") + coord_flip() + theme_bw() +theme(text = element_text(size=13)) +
+  xlab("University Class") + ylab("Proportion of Applicants (%)")
+
+indiv_data %>% group_by(UniversityClass, sex) %>% 
+  summarise(Accept_Ratio  = 100*mean(accept), N = n()) %>% 
+  ggplot() + geom_bar(aes(x = UniversityClass, fill = sex, y = Accept_Ratio ), 
+                                   position = "dodge", stat = "identity") + coord_flip() + theme_bw() +theme(text = element_text(size=13)) +
+    xlab("University Class") + ylab("Acceptance Ratio (%)")
+
+indiv_data <- 
+  indiv_data %>% 
+  mutate(mean_gpa = 100*mean_gpa) %>% 
+  mutate(GPA_discrete = cut(mean_gpa, breaks = c(-1, 60, 70, 80, 90, 101))) %>% 
+  mutate(GPA_discrete = as.character(GPA_discrete)) %>% 
+  mutate(GPA_discrete = ifelse(GPA_discrete == "(-1,60]", "< 60%", GPA_discrete)) %>% 
+  mutate(GPA_discrete = ifelse(GPA_discrete == "(90,101]", "> 90%", GPA_discrete)) %>% 
+  mutate(GPA_discrete = factor(GPA_discrete)) %>%  
+  mutate(GPA_discrete = factor(GPA_discrete, levels = c("< 60%", "(60,70]", "(70,80]", "(80,90]", "> 90%")))
+
+indiv_data %>% 
+  group_by(sex, GPA_discrete) %>% 
+  summarise(NumberOFapplicants = n()) %>% 
+  rename(Gender = sex) %>% 
+  left_join(gender_sum) %>% 
+  mutate(Proportion = 100*NumberOFapplicants/N) %>% 
+  ggplot() + geom_bar(aes(x = GPA_discrete, fill = Gender, y = Proportion), 
+                                   position = "dodge", stat = "identity") +
+  xlab("GPA Range (100 Points Scale)") + 
+  ylab("Proportion of Applicants (%)") +
+  coord_flip() + theme(text = element_text(size=13)) + theme_bw()
+
+indiv_data %>% 
+  rename(Gender = sex) %>% 
+  # mutate(MeanGPA = cut(mean_gpa, 5)) %>% 
+  group_by(GPA_discrete, Gender) %>% 
+  summarise(Accept_Ratio= 100*mean(accept), N = n()) %>% 
+  ggplot() + geom_bar(aes(x = GPA_discrete, fill = Gender, y = Accept_Ratio), 
+                      position = "dodge", stat = "identity") +
+    xlab("GPA Range (100 Points Scale)") + 
+  ylab("Acceptance Ratio (%)") + 
+  coord_flip()+ theme_bw() +theme(text = element_text(size=13)) 
+
+
+count_tbl <- indiv_data %>% group_by(univ_class) %>% 
+  summarise(accept_ratio = mean(accept), N = n()) %>% 
+  filter(N > 10)
+
+##different spec depending on school
+#studyabroad
+indiv_data %>% 
+  rename(Gender = sex) %>% 
+  group_by(UniversityClass, Gender) %>% 
+  summarise(StudyAbroadExp = 100*mean(abroad_exp_profe), N = n()) %>% 
+  ggplot() + geom_bar(aes(x = UniversityClass, fill = Gender, y = StudyAbroadExp), 
+                                   position = "dodge", stat = "identity") + 
+  xlab("University Class") + ylab("Study Abroad Experience (%)") + 
+  coord_flip() + theme_bw() +theme(text = element_text(size=13))  +
+  ggtitle("Study Abroad")
+
+#Intern
+indiv_data %>% 
+  rename(Gender = sex) %>% 
+  group_by(UniversityClass, Gender) %>% 
+  summarise(InternshipExp = 100*mean(intern_exp), N = n()) %>% 
+  ggplot() + geom_bar(aes(x = UniversityClass, fill = Gender, y = InternshipExp), 
+                                   position = "dodge", stat = "identity") + 
+  ylab("Internship Experience (%)") +   xlab("University Class") + 
+  coord_flip() + theme_bw() +theme(text = element_text(size=13)) +
+  ggtitle("Internship")
+
+#meangpa
+indiv_data %>% 
+  rename(Gender = sex) %>%   
+  group_by(UniversityClass, Gender) %>% 
+  summarise(MeanGPA = mean(mean_gpa), N = n()) %>% 
+  ggplot() + geom_bar(aes(x = UniversityClass, fill = Gender, y =MeanGPA), 
+                                   position = "dodge", stat = "identity") + 
+  coord_flip() + theme_bw() +theme(text = element_text(size=13)) +   xlab("University Class") + 
+  ylab("Average GPA (100 Point scale)") +
+  ggtitle("Average GPA")
+
+#award
+indiv_data %>% 
+    rename(Gender = sex) %>%   
+  group_by(UniversityClass, Gender) %>% 
+  summarise(AwardExp = 100*mean(award_exp), N = n()) %>% 
+  ggplot() + geom_bar(aes(x = UniversityClass, fill = Gender, y =AwardExp), 
+                                   position = "dodge", stat = "identity") + 
+   coord_flip() + theme_bw() +theme(text = element_text(size=13))  +
+  xlab("University Class") + 
+  ylab("External Award Recognition (%)") +
+  ggtitle("External Award Recognition")
+```
+
+```{r summary statistics}
+## summary statistics
+summary(indiv_data$accept)
+sd(indiv_data$accept)
+count(indiv_data,edu_final)
+
+indiv_data <- indiv_data %>% mutate(female = ifelse(sex == 'Female',1,0)) %>% 
+  mutate(abroad_exp_profe = ifelse(abroad_exp_profe=='TRUE',1,0)) %>% 
+  mutate(intern_exp = ifelse(intern_exp=='TRUE',1,0)) %>% 
+  mutate(award_exp = ifelse(award_exp=='TRUE',1,0))
+
+indiv_data %>% select(female, age, abroad_exp_profe, award_exp, intern_exp, mean_gpa, accept) %>% 
+  summarise_all(mean) %>% 
+  gather(index, mean) %>% 
+  left_join(indiv_data %>% select(female, age, abroad_exp_profe, award_exp, intern_exp, mean_gpa, accept) %>% 
+  summarise_all(sd) %>% 
+  gather(index, sd))
+
+
+# t test between male and female
+
+indiv_data_female <- indiv_data %>% filter(sex =='Female')
+indiv_data_male <- indiv_data %>% filter(sex =='Male')
+  
+#Accept  
+mean(indiv_data$accept)
+t.test(indiv_data_female$accept, indiv_data_male$accept,  paired = FALSE, var.equal = FALSE, conf.level = 0.95)
+
+#Age 
+  
+mean(indiv_data$age)
+t.test(indiv_data_female$age, indiv_data_male$age,  paired = FALSE, var.equal = FALSE, conf.level = 0.95)
+
+#Study abroad 
+  
+mean(indiv_data$abroad_exp_profe)
+t.test(indiv_data_female$abroad_exp_profe, indiv_data_male$abroad_exp_profe,  paired = FALSE, var.equal = FALSE, conf.level = 0.95)
+
+#Award 
+  
+mean(indiv_data$award_exp)
+t.test(indiv_data_female$award_exp, indiv_data_male$award_exp,  paired = FALSE, var.equal = FALSE, conf.level = 0.95)
+
+#internship
+
+mean(indiv_data$intern_exp)
+t.test(indiv_data_female$intern_exp, indiv_data_male$intern_exp,  paired = FALSE, var.equal = FALSE, conf.level = 0.95)
+
+
+#certificate
+
+mean(indiv_data$certificate)
+t.test(indiv_data_female$certificate, indiv_data_male$certificate,  paired = FALSE, var.equal = FALSE, conf.level = 0.95)
+
+#mean GPA
+
+mean(indiv_data$mean_gpa)
+t.test(indiv_data_female$mean_gpa, indiv_data_male$mean_gpa,  paired = FALSE, var.equal = FALSE, conf.level = 0.95)
+
+
+```
+
+## fitting
+```{r fitting}
+## logit fitting : Pooled sample
+
+indiv_data <- 
+  indiv_data %>% 
+  mutate(sex = relevel(factor(sex), ref = "Male") ) %>% 
+  mutate(work_type = relevel(factor(work_type), ref = 'Support'))  %>% 
+  mutate(UniversityClass = relevel(factor(UniversityClass), ref = "etc"))
+  
+fit_glm <- glm(accept ~ wage_disc + edu_final + intern_exp + abroad_exp_profe + award_exp + certificate  +  UniversityClass +  univ_major +   english_discrete + sex + age +  mean_gpa + I(mean_gpa^2)  + work_type +  quarter, 
+               data = indiv_data, family = "binomial") 
+
+## logit fitting for each work_types
+#work_type <- unique(indiv_data$work_type)
+
+#work_type_model_list <- list()
+#for (w in seq_along(work_type)){
+# work_type_model_list[[w]] <- 
+#    glm(accept ~ wage_disc + edu_final + intern_exp + abroad_exp_profe + award_exp + #certificate  +  UniversityClass +  univ_major +   english_discrete + sex + age +  mean_gpa  +  quarter, 
+#                family = "binomial", data = indiv_data %>% filter(work_type==work_type[[w]])) 
+# names(work_type_model_list)[w] <- work_type[[w]] %>% as.character
+#}
+
+fit_glm_marketing <- glm(accept ~ wage_disc + edu_final + intern_exp + abroad_exp_profe + award_exp + certificate  +  UniversityClass +  univ_major +   english_discrete + sex + age +  mean_gpa + I(mean_gpa^2)   +  quarter, 
+               data = indiv_data%>% filter(work_type=='Marketing'), family = "binomial") 
+
+fit_glm_production<- glm(accept ~ wage_disc + edu_final + intern_exp + abroad_exp_profe + award_exp + certificate  +  UniversityClass +  univ_major +   english_discrete + sex + age +  mean_gpa + I(mean_gpa^2)   +  quarter, 
+               data = indiv_data %>% 
+                  filter(work_type=='Production'), family = "binomial") 
+
+fit_glm_support<- glm(accept ~ wage_disc + edu_final + intern_exp + abroad_exp_profe + award_exp + certificate  +  UniversityClass +  univ_major +   english_discrete + sex + age +  mean_gpa + I(mean_gpa^2)   +  quarter, 
+               data = indiv_data %>% 
+                 filter(work_type=='Support'), family = "binomial") 
+
+##fitting by quarter
+
+#quarter_vec <- unique(indiv_data$quarter)
+#quarter_model_list <- list()
+#for (w in seq_along(quarter_vec)){
+#  quarter_model_list[[w]]  <- glm(accept ~ wage_disc + edu_final + intern_exp + abroad_exp_profe + award_exp + certificate  +  UniversityClass +  univ_major +   english_discrete + sex + age +  mean_gpa + work_type , 
+ #                                 family = "binomial", data = indiv_data %>% 
+ #                filter(quarter==quarter_vec[w])) 
+# names(quarter_model_list)[w] <- quarter_vec[[w]] %>% as.character
+#}
+
+fit_glm_1st <- glm(accept ~ wage_disc + edu_final + intern_exp + abroad_exp_profe + award_exp + certificate  +  UniversityClass +  univ_major +   english_discrete + sex + age +  mean_gpa + I(mean_gpa^2)  + work_type , 
+               data = indiv_data %>% 
+                 filter(quarter=='1st'), family = "binomial") 
+
+fit_glm_2nd<- glm(accept ~ wage_disc + edu_final + intern_exp + abroad_exp_profe + award_exp + certificate  +  UniversityClass +  univ_major +   english_discrete + sex + age +  mean_gpa + I(mean_gpa^2)  + work_type ,
+               data = indiv_data %>% 
+                  filter(quarter=='2nd'), family = "binomial") 
+
+fit_glm_3rd<- glm(accept ~ wage_disc + edu_final + intern_exp + abroad_exp_profe + award_exp + certificate  +  UniversityClass +  univ_major +   english_discrete + sex + age +  mean_gpa + I(mean_gpa^2)  + work_type ,
+               data = indiv_data %>% 
+                 filter(quarter=='3rd'), family = "binomial") 
+
+fit_glm_4th<- glm(accept ~ wage_disc + edu_final + intern_exp + abroad_exp_profe + award_exp + certificate  +  UniversityClass +  univ_major +   english_discrete + sex + age +  mean_gpa + I(mean_gpa^2)  + work_type ,
+               data = indiv_data %>% 
+                 filter(quarter=='4th'), family = "binomial") 
+
+```
+
+## Table export
+```{r tables}
+##Logit model export to Latex
+
+#stargazer(coeftest(fit_glm, vcov = vcovHC(fit_glm, type = "HC1")), 
+#          coeftest(work_type_model_list$Marketing, vcov = #vcovHC(work_type_model_list$Marketing, type = "HC1")), 
+#          coeftest(work_type_model_list$Production, vcov = #vcovHC(work_type_model_list$Production, type ="HC1")),
+#          coeftest(work_type_model_list$Support, vcov = #vcovHC(work_type_model_list$Support, type ="HC1")),
+#          title="Results", align=TRUE)
+
+#stargazer(fit_glm, work_type_model_list$Marketing,
+#          work_type_model_list$Production,
+#          work_type_model_list$Support,
+#          title="Results", align=TRUE)
+
+stargazer(coeftest(fit_glm, vcov = vcovHC(fit_glm, type = "HC1")), 
+          coeftest(fit_glm_marketing, vcov = vcovHC(fit_glm_marketing, type = "HC1")), 
+          coeftest(fit_glm_production, vcov = vcovHC(fit_glm_production, type ="HC1")),
+          coeftest(fit_glm_support, vcov = vcovHC(fit_glm_support, type ="HC1")),
+          title="Results", align=TRUE)
+#GPA prime number: 83.75,
+stargazer(fit_glm, fit_glm_marketing,
+          fit_glm_production,
+          fit_glm_support,
+          title="Results", align=TRUE)
+
+stargazer(coeftest(fit_glm, vcov = vcovHC(fit_glm , type = "HC1")), 
+          coeftest(fit_glm_1st, vcov = vcovHC(fit_glm_1st, type = "HC1")), 
+          coeftest(fit_glm_2nd, vocv = vcovHC(fit_glm_2nd, type = "HC1")),  
+          coeftest(fit_glm_3rd, vocv = vcovHC(fit_glm_3rd, type = "HC1")), 
+          coeftest(fit_glm_4th, vcov = vcovHC(fit_glm_4th, type = "HC1")),   title="Results", align=TRUE)
+
+stargazer(fit_glm, 
+          fit_glm_1st,
+          fit_glm_2nd,
+          fit_glm_3rd,
+          fit_glm_4th,
+          title="Results", align = TRUE)
+```
+## R correlation
+```{r correlation}
+
+main_var <- indiv_data %>% 
+  select(accept, female, age, abroad_exp_profe, award_exp, intern_exp, certificate, mean_gpa)
+
+res <- rcorr(as.matrix(main_var))
+corr.matrix <- as.data.frame(res$r)
+corr.p <- as.data.frame(res$P)
+write.csv(corr.matrix,"corr.matrix.csv")
+write.csv(corr.p,"corr.p.csv")
+```
+
+
+## gender prediction
+```{r gender prediction - validation set exclude by random}
+indiv_data <- indiv_data %>% mutate(UniversityClass = as.factor(UniversityClass))
+indiv_data <- indiv_data %>% mutate(sex = as.factor(sex))
+#Algorithm : CART (Classification and regression tree)
+#validation set exclude by random
+set.seed(4)
+train_ind <- sample(seq_len(nrow(indiv_data)), size = 10000)
+
+indiv_data_train <- indiv_data[train_ind, ]
+indiv_data_validation  <- indiv_data[-train_ind, ]
+
+### CART Modeling using caret
+control <- trainControl(method="repeatedcv", number=5, repeats=5, classProbs=TRUE)
+
+indiv_data_train_var <- indiv_data_train[,c('id','wage_disc','intern_exp' ,'abroad_exp_profe','award_exp', 'certificate' , 'edu_final', 'UniversityClass', 'univ_major', 'english_discrete', 'sex', 'age' ,'mean_gpa')]
+
+indiv_data_train_var[,c('wage_disc','intern_exp' ,'abroad_exp_profe','award_exp', 'edu_final','UniversityClass',  'english_discrete', 'sex', 'univ_major')] <- lapply(indiv_data_train_var[,c('wage_disc','intern_exp' ,'abroad_exp_profe','award_exp', 'edu_final','UniversityClass',  'english_discrete', 'sex', 'univ_major')] , factor)
+
+
+#down sampling of not accept in training set
+set.seed(3)
+indiv_data_train_var <- downSample(x = indiv_data_train_var[, -11],
+                         y = indiv_data_train_var$sex, yname = "sex" )
+
+
+Tree_model <- caret::train((sex) ~ .,
+                         data = subset(indiv_data_train_var, select=-id),
+                         method = "rpart",
+                         preProcess = NULL,
+                         trControl = control,
+                         metric = "Accuracy")
+
+plot(Tree_model$finalModel)
+text(Tree_model$finalModel, use.n=TRUE, all=TRUE, cex=.66)
+
+indiv_data_validation_var <- indiv_data_validation[,c('id','wage_disc','intern_exp' ,'abroad_exp_profe','award_exp', 'certificate' , 'edu_final', 'UniversityClass', 'univ_major', 'english_discrete', 'sex', 'age' ,'mean_gpa')]
+
+indiv_data_validation_var[,c('wage_disc','intern_exp' ,'abroad_exp_profe','award_exp', 'edu_final','UniversityClass',  'english_discrete', 'sex', 'univ_major')] <- lapply(indiv_data_validation_var[,c('wage_disc','intern_exp' ,'abroad_exp_profe','award_exp', 'edu_final','UniversityClass',  'english_discrete', 'sex', 'univ_major')] , factor)
+
+
+
+predicted <- predict(Tree_model, indiv_data_validation_var)
+Tree.result.random.validation <- cbind(Applicant_ID=indiv_data_validation$id,Observed=indiv_data_validation$sex, predicted)
+
+##confusion matrix
+Tree.result.random.validation <- as.data.frame(Tree.result.random.validation)
+
+#accuracy for validation set
+Tree.result.random.validation <- Tree.result.random.validation %>% mutate(Observed = as.factor(Observed))
+Tree.result.random.validation <- Tree.result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(Tree.result.random.validation$predicted ,Tree.result.random.validation$Observed, positive = '2')
+
+##########roc
+
+result.prob.tree <- predict(Tree_model, indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.cart.gender <- roc(indiv_data_validation_var$sex, result.prob.tree$Male)
+
+result.coords <- coords(result.roc.cart.gender, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+auc(result.roc.cart.gender)
+#AUC: 0.7854
+
+#Logistic regression
+LG_model <-caret::train((sex) ~ .,
+                         data = subset(indiv_data_train_var, select=-id),
+                         method = "glm",
+                         preProcess = NULL,
+                         trControl = control,
+                         metric = "Accuracy")
+
+predicted <- predict(LG_model, indiv_data_validation_var)
+LG.result.random.validation <- cbind(Applicant_ID=indiv_data_validation$id,Observed=indiv_data_validation$sex, predicted)
+
+##confusion matrix
+LG.result.random.validation <- as.data.frame(LG.result.random.validation)
+
+
+#accuracy for validation set
+LG.result.random.validation <- LG.result.random.validation %>% mutate(Observed = as.factor(Observed))
+LG.result.random.validation <- LG.result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(LG.result.random.validation$predicted, LG.result.random.validation$Observed,positive='2')
+
+
+###AUC 
+result.predicted.prob <- predict(LG_model, indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.lg.gender <- roc(indiv_data_validation_var$sex, result.predicted.prob$Male)
+result.coords <- coords(result.roc.lg.gender, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and accuracy
+auc(result.roc.lg.gender)
+#0.8821
+
+##neural net model
+
+set.seed(2)
+nn_model <- caret::train((sex) ~ .,
+                         data = subset(indiv_data_train_var, select=-id),
+                         method = "nnet",
+                        trControl = control,
+                         metric = "Accuracy")
+
+
+predicted <- predict(nn_model, indiv_data_validation_var)
+nn.result.random.validation <- cbind(Applicant_ID=indiv_data_validation$id,Observed=indiv_data_validation$sex, predicted)
+
+##confusion matrix
+nn.result.random.validation <- as.data.frame(nn.result.random.validation)
+
+#accuracy for validation set
+
+nn.result.random.validation <- nn.result.random.validation %>% mutate(predicted = as.factor(predicted))
+nn.result.random.validation <- nn.result.random.validation %>% mutate(Observed = as.factor(Observed))
+
+confusionMatrix(nn.result.random.validation$predicted, nn.result.random.validation$Observed, positive = '2')
+
+#auc
+
+result.predicted.prob <- predict(nn_model, indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.nn.gender <- roc(indiv_data_validation_var$sex, result.predicted.prob$Male) 
+result.coords <- coords(result.roc.nn.gender, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and accuracy
+auc(result.roc.nn.gender)
+#0.8837
+
+#xgboost
+set.seed(1)
+xgboost_model <- caret::train((sex) ~ .,
+                         data = subset(indiv_data_train_var, select=-id),
+                         method = "xgbTree",
+                         trControl = control,
+                         metric = "Accuracy")
+
+predicted <- predict(xgboost_model, indiv_data_validation_var)
+xgboost.result.random.validation <- cbind(Applicant_ID=indiv_data_validation$id,Observed=indiv_data_validation$sex, predicted)
+
+##confusion matrix
+xgboost.result.random.validation <- as.data.frame(xgboost.result.random.validation)
+
+#accuracy for validation set
+xgboost.result.random.validation <- xgboost.result.random.validation %>% mutate(predicted = as.factor(predicted))
+xgboost.result.random.validation <- xgboost.result.random.validation %>% mutate(Observed = as.factor(Observed))
+confusionMatrix(xgboost.result.random.validation$predicted, xgboost.result.random.validation$Observed, positive = '2')
+
+#roc
+result.predicted.prob <- predict(xgboost_model, indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.xgboost.gender <- roc(indiv_data_validation_var$sex, result.predicted.prob$Male) # Draw ROC curve.
+
+result.coords <- coords(result.roc.xgboost.gender, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and accuracy
+auc(result.roc.xgboost.gender)
+#0.8872
+
+### rf Modeling using caret
+set.seed(2)
+rf_model <- caret::train((sex) ~ .,
+                         data = subset(indiv_data_train_var, select=-id),
+                         method = "rf",
+                         trControl = control,
+                         metric = "Accuracy")
+
+
+predicted <- predict(rf_model, indiv_data_validation_var)
+xgboost.result.random.validation <- cbind(Applicant_ID=indiv_data_validation$id,Observed=indiv_data_validation$sex, predicted)
+
+##confusion matrix
+rf.result.random.validation <- as.data.frame(xgboost.result.random.validation)
+
+#accuracy for validation set
+
+rf.result.random.validation <- rf.result.random.validation %>% mutate(predicted = as.factor(predicted))
+rf.result.random.validation <- rf.result.random.validation %>% mutate(Observed = as.factor(Observed))
+confusionMatrix(rf.result.random.validation$predicted, rf.result.random.validation$Observed, positive = '2')
+
+#roc
+result.predicted.prob <- predict(rf_model, indiv_data_validation_var, type="prob") # Prediction
+set.seed(2)
+result.roc.rf.gender <- roc(indiv_data_validation_var$sex, result.predicted.prob$Male) # Draw ROC curve.
+plot(result.roc.cart.gender,print.thres.best.method="closest.topleft")
+plot(result.roc.lg.gender, add = TRUE, col = 'red' )
+plot(result.roc.nn.gender, add = TRUE, col = 'orange' )
+plot(result.roc.xgboost.gender, add = TRUE, col = 'green')
+plot(result.roc.rf.gender, add = TRUE, col = 'blue')
+set.seed(2)
+result.coords <- coords(result.roc.rf.gender, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)
+auc(result.roc.rf.gender)
+
+```
+
+## Prediction Simulation
+```{r prediction - validation set exclude by random}
+##MY: I made a new variable of revenue in previous year as predictor variable
+#2014   2015 영업이익
+# 406,256,506.00  401082327.00
+#2014   2015 순이익
+#  345084357.50   417522863.50
+
+indiv_data <- indiv_data %>% mutate(profit = ifelse( (quarter =='1st')|(quarter =='2nd') , 406 ,  401))
+indiv_data <- indiv_data %>% mutate(net_income = ifelse( (quarter =='1st')|(quarter =='2nd') ,  345,   417))
+
+##senario 1
+#Algorithm : CART (Classification and regression tree)
+#validation set exclude by random
+
+indiv_data <- indiv_data %>% 
+  select(id, sex, accept, age, wage_disc, intern_exp, abroad_exp_profe, award_exp, 
+          certificate, edu_final, UniversityClass, univ_major, 
+          english_discrete, mean_gpa, profit, net_income) %>% 
+  mutate_at(c('wage_disc','intern_exp' ,'abroad_exp_profe','award_exp', 'edu_final','UniversityClass',  'english_discrete', 'sex', 'univ_major'), 
+            as.factor) %>% 
+  mutate(accept = ifelse(accept==1,'zaccept','notaccept')) %>% 
+  mutate(accept = as.factor(accept))
+
+set.seed(4)
+train_ind <- sample(seq_len(nrow(indiv_data)), size = 10000)
+
+indiv_data_train_var <- indiv_data[train_ind, ]
+indiv_data_validation_var  <- indiv_data[-train_ind, ]
+
+### CART Modeling using caret
+control <- trainControl(method="repeatedcv", number=5, repeats=5, classProbs=TRUE)
+
+#down sampling of not accept in training set
+set.seed(3)
+indiv_data_train_var <- downSample(x = indiv_data_train_var[, -3],
+                         y = indiv_data_train_var$accept, yname = "accept" )
+
+```
+
+### Bias assessment
+
+```{r bias assessment, message = FALSE}
+method_vec <- c("rpart","glm", "nnet", "xgbTree", "rf")
+test_model_list <- list()
+set.seed(2)
+for (k in seq_along(method_vec)){
+  cat("---------------", k,"---------------\n")
+  test_model_list[[k]] <- 
+  train((accept) ~ .,
+                         data = subset(indiv_data_train_var, select=sex:accept),
+                         method = method_vec[k],
+                         preProcess = NULL, 
+                         metric = "Accuracy") 
+  names(test_model_list)[k] <- method_vec[k]
+}
+
+#CART
+
+plot(test_model_list[[1]]$finalModel)
+text(test_model_list[[1]]$finalModel, use.n=TRUE, all=TRUE, cex=.66)
+
+#AUC, PPV, acceptance ratio difference
+predicted <- predict(test_model_list[[1]], indiv_data_validation_var)
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var$id,Observed=indiv_data_validation_var$accept, predicted)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+
+#accuracy for validation set
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+result.random.validation <- result.random.validation %>% mutate(predicted = ifelse(predicted==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(result.random.validation$predicted ,result.random.validation$Observed, positive = '1')
+
+##########roc
+
+result.prob.cart1 <- predict(test_model_list[[1]], indiv_data_validation_var, type="prob") # Prediction
+result.roc.cart1 <- roc(indiv_data_validation_var$accept, result.prob.cart1$notaccept) # Draw ROC curve.
+plot(result.roc.cart1,  print.thres.best.method="closest.topleft")
+result.coords <- coords(result.roc.cart1, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+#0.4701612 0.5968755
+auc(result.roc.cart1)
+#AUC: 0.6243
+#PPV: 0.10157
+#Predicted accept: 2468 + 279 = 2,747
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data)
+result.random.validation.accept <-result.random.validation.info %>% filter(predicted == 1)
+
+#acceptance rate 비교
+count(result.random.validation.info,sex)
+count(result.random.validation.accept,sex)
+#female : 0 / 2323 = 0
+#male : 2747  / 4206 =  0.653 -> 0.653
+
+unique_list <- lapply(indiv_data_train_var[,-1], unique)
+
+B <- 1e6
+a <- 1:10
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble
+ grid_set$yhat <- predict(test_model_list[[1]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##bia of model= 0.08721334
+bias_test.male <- bias_test %>% filter(sex=='Male')
+bias_test.female <- bias_test %>% filter(sex=='Female')
+mean(bias_test.male$yhat) - mean(bias_test.female$yhat)
+
+bias_test$Gender <- bias_test$sex
+bias_test <- bias_test %>% mutate(Gender = relevel(factor(Gender), ref = "Female") )  
+
+
+bias_test %>%
+  group_by(Gender, age) %>% 
+  summarise(Score = mean(yhat)) %>% 
+  ggplot() + 
+  aes(x = age, y = Score, col = Gender) + geom_point() + geom_line() + theme_bw() +
+  xlab("Age (years)") + ylab("Score (Probability of Acceptance)")
+
+
+bias_test %>%
+  group_by(Gender, mean_gpa) %>% 
+  summarise(Score = mean(yhat)) %>% 
+  ggplot() + 
+  aes(x = mean_gpa, y = Score, col = Gender) + geom_point() + geom_line() + theme_bw()+
+  xlab("Average GPA (100 Point Scale)") + ylab("Score (Probability of Acceptance)")
+
+bias_test %>%
+  group_by(Gender, UniversityClass) %>% 
+  summarise(Score = mean(yhat)) %>% 
+  ggplot() + 
+  aes(x = UniversityClass, y = Score, group = Gender, fill =Gender) + geom_bar(stat = "identity", position = "dodge") + theme_bw() + coord_flip()+
+  xlab("University Class") + ylab("Score (Probability of Acceptance)")
+
+bias_test %>%
+  group_by(Gender, intern_exp) %>% 
+  summarise(Score = mean(yhat)) %>% 
+  ggplot() + 
+  aes(x = intern_exp, y = Score, group = Gender, fill = Gender) + geom_bar(stat = "identity", position = "dodge") + theme_bw() + coord_flip()+
+  xlab("Internship Experience") + ylab("Score (Probability of Acceptance)")
+
+bias_test %>%
+  group_by(Gender, certificate) %>% 
+  summarise(Score = mean(yhat)) %>% 
+  ggplot() + 
+  aes(x =certificate, y = Score, group = Gender, fill = Gender) + geom_bar(stat = "identity", position = "dodge") + theme_bw()+ coord_flip()+
+  xlab("Number of Certificates") + ylab("Score (Probability of Acceptance)")
+
+bias_test %>%
+  group_by(Gender, abroad_exp_profe) %>% 
+  summarise(Score = mean(yhat)) %>% 
+  ggplot() + 
+  aes(x =abroad_exp_profe, y = Score, group =Gender, fill = Gender) + geom_bar(stat = "identity", position = "dodge") + theme_bw()+ coord_flip()+
+  xlab("Study Abroad Experience") + ylab("Score (Probability of Acceptance)")
+
+###########################
+############glm############
+###########################
+
+##MY: Logistic regression에서는 mean_gpa의 square term이 들어가야 하므로, 별도로 만들어줌. 
+indiv_data_train_var <- indiv_data_train_var %>% mutate(mean_gpa2 = I(mean_gpa^2))
+indiv_data_validation_var <- indiv_data_validation_var %>% mutate(mean_gpa2 = I(mean_gpa^2))
+
+test_model_list[[2]] <- train((accept) ~ .,
+                         data = subset(indiv_data_train_var, select=-id),
+                         method = "glm",
+                         preProcess = NULL, 
+                         metric = "Accuracy") 
+
+test_model_list[[2]]$finalModel
+
+#AUC, PPV, acceptance ratio difference
+predicted <- predict(test_model_list[[2]], indiv_data_validation_var)
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var$id,Observed=indiv_data_validation_var$accept, predicted)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+
+#accuracy for validation set
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+result.random.validation <- result.random.validation %>% mutate(predicted = ifelse(predicted==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(result.random.validation$predicted ,result.random.validation$Observed, positive = '1')
+
+##########roc
+
+result.prob.lg <- predict(test_model_list[[2]], indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.lg1 <- roc(indiv_data_validation_var$accept, result.prob.lg$notaccept) # Draw ROC curve.
+plot(result.roc.lg1,  print.thres.best.method="closest.topleft")
+
+result.coords <- coords(result.roc.lg1, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+#0.5171155 0.7229285
+auc(result.roc.lg1)
+#AUC: 0.8007
+#PPV: 0.16417  
+#Predicted accept: 1619  318= 1,937,
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data)
+result.random.validation.accept <-result.random.validation.info %>% filter(predicted == 1)
+
+#acceptance rate 비교
+count(result.random.validation.info,sex)
+count(result.random.validation.accept,sex)
+#female :497  / 2323 = 0.214
+#male : 1440 / 4206 =  0.342 -> 0.128
+
+unique_list <- lapply(indiv_data_train_var[,-c(1)], unique)
+
+B <- 1e6
+a <- 1:10
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble
+ grid_set$yhat <- predict(test_model_list[[2]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##bia of model= 0.09572305
+bias_test.male <- bias_test %>% filter(sex=='Male')
+bias_test.female <- bias_test %>% filter(sex=='Female')
+mean(bias_test.male$yhat) - mean(bias_test.female$yhat)
+
+##To check distortion of rule
+#domestic top 3 & age <= 24 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.5171155,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#0.8111653
+
+highspec <- indiv_data  %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+count(highspec,accept) 
+count(highspec,sex)
+
+
+##############nnet################
+
+#AUC, PPV, acceptance ratio difference
+predicted <- predict(test_model_list[[3]], indiv_data_validation_var)
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var$id,Observed=indiv_data_validation_var$accept, predicted)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+
+#accuracy for validation set
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+result.random.validation <- result.random.validation %>% mutate(predicted = ifelse(predicted==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(result.random.validation$predicted ,result.random.validation$Observed, positive = '1')
+
+##########roc
+result.prob.nn <- predict(test_model_list[[3]], indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.nn1 <- roc(indiv_data_validation_var$accept, result.prob.nn$notaccept) # Draw ROC curve.
+plot(result.roc.nn1,  print.thres.best.method="closest.topleft")
+
+result.coords <- coords(result.roc.nn1, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+#0.5368747 0.7056211  
+auc(result.roc.nn1)
+#AUC: 0.7733
+#PPV: 0.15749   
+#Predicted accept: 1637  306 =1,943
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data)
+result.random.validation.accept <-result.random.validation.info %>% filter(predicted == 1)
+
+#acceptance rate 비교
+count(result.random.validation.accept,sex)
+#female : 467 / 2323 = 0.201
+#male : 1476 / 4206 =  0.351 -> 0.150
+
+
+unique_list <- lapply(indiv_data_train_var[,-c(1,17)], unique)
+
+B <- 1e6
+a <- 1:10
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble
+ grid_set$yhat <- predict(test_model_list[[3]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##bia of model= 0.156708
+bias_test.male <- bias_test %>% filter(sex=='Male')
+bias_test.female <- bias_test %>% filter(sex=='Female')
+mean(bias_test.male$yhat) - mean(bias_test.female$yhat)
+
+
+##To check distortion of rule
+#domestic top 3 & age <= 23 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.5368747,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#0.8893893
+
+
+###################
+######XGboost######
+###################
+
+gbmImp <- varImp(test_model_list[[4]], scale = TRUE)
+gbmImp
+
+#AUC, PPV, acceptance ratio difference
+predicted <- predict(test_model_list[[4]], indiv_data_validation_var)
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var$id,Observed=indiv_data_validation_var$accept, predicted)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+
+#accuracy for validation set
+result.random.validation <- result.random.validation %>% mutate(Observed= ifelse(Observed==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+result.random.validation <- result.random.validation %>% mutate(predicted = ifelse(predicted==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(result.random.validation$predicted ,result.random.validation$Observed, positive = '1')
+
+##########roc
+result.prob.xg <- predict(test_model_list[[4]], indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.xg1 <- roc(indiv_data_validation_var$accept, result.prob.xg$notaccept) # Draw ROC curve.
+plot(result.roc.xg1,  print.thres.best.method="closest.topleft")
+
+result.coords <- coords(result.roc.xg1, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+#0.4973835 0.7445244 
+auc(result.roc.xg1)
+
+#AUC: 0.7991
+#PPV:0.17236 
+#Predicted accept:  1575  328 = 1,903
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data)
+result.random.validation.accept <-result.random.validation.info %>% filter(predicted == 1)
+
+#acceptance rate 비교
+
+count(result.random.validation.accept,sex)
+#female : 495 / 2323 = 0.213
+#male : 1408 / 4206 =  0.335-> 0.122,
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble
+ grid_set$yhat <- predict(test_model_list[[4]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##bia of model=  0.2053385
+bias_test.male <- bias_test %>% filter(sex=='Male')
+bias_test.female <- bias_test %>% filter(sex=='Female')
+mean(bias_test.male$yhat) - mean(bias_test.female$yhat)
+
+##To check distortion of rule
+#domestic top 3 & age <= 23 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.4973835,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#1
+###################
+######rf######
+###################
+
+gbmImp <- varImp(test_model_list[[5]], scale = TRUE)
+gbmImp
+
+#AUC, PPV, acceptance ratio difference
+predicted <- predict(test_model_list[[5]], indiv_data_validation_var)
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var$id,Observed=indiv_data_validation_var$accept, predicted)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+
+#accuracy for validation set
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+result.random.validation <- result.random.validation %>% mutate(predicted = ifelse(predicted==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(result.random.validation$predicted ,result.random.validation$Observed, positive = '1')
+
+##########roc
+result.prob.rf <- predict(test_model_list[[5]], indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.rf1 <- roc(indiv_data_validation_var$accept, result.prob.xg$notaccept) # Draw ROC curve.
+plot(result.roc.rf1,  print.thres.best.method="closest.topleft")
+result.coords <- coords(result.roc.rf1, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+#0.4973835 0.7445244 
+auc(result.roc.rf1)
+#AUC: 0.7991
+#PPV: 0.14643 
+#Predicted accept: 1807  310 = 2,117
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data)
+result.random.validation.accept <-result.random.validation.info %>% filter(predicted == 1)
+
+#acceptance rate 비교
+count(result.random.validation.accept,sex)
+#female : 539 / 2323 = 0.2320
+#male : 1578 / 4206 =  0.375 -> 0.143
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble
+ grid_set$yhat <- predict(test_model_list[[5]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##bia of model=  0.03422941
+bias_test.male <- bias_test %>% filter(sex=='Male')
+bias_test.female <- bias_test %>% filter(sex=='Female')
+mean(bias_test.male$yhat) - mean(bias_test.female$yhat)
+
+#To check distortion of rule
+#domestic top 3 & age <= 24 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.4973835,1,0))
+mean(result.random.validation.bias.highspec$accept)
+```
+
+### Bias assessment for scenario 2
+```{r bias assessment, message = FALSE}
+method_vec <- c("rpart","glm", "nnet", "xgbTree", "rf")
+test_model_list_no_gender <- list()
+set.seed(2)
+for (k in seq_along(method_vec)){
+  cat("---------------", k,"---------------\n")
+  test_model_list_no_gender[[k]] <- 
+  train((accept) ~ .,
+                         data = subset(indiv_data_train_var, select=age:accept),
+                         method = method_vec[k],
+                         preProcess = NULL, 
+                         metric = "Accuracy") 
+  names(test_model_list_no_gender)[k] <- method_vec[k]
+}
+
+#CART
+
+plot(test_model_list_no_gender[[1]]$finalModel)
+text(test_model_list_no_gender[[1]]$finalModel, use.n=TRUE, all=TRUE, cex=.66)
+
+#AUC, PPV, acceptance ratio difference
+predicted <- predict(test_model_list_no_gender[[1]], indiv_data_validation_var)
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var$id,Observed=indiv_data_validation_var$accept, predicted)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+
+#accuracy for validation set
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+result.random.validation <- result.random.validation %>% mutate(predicted = ifelse(predicted==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(result.random.validation$predicted ,result.random.validation$Observed, positive = '1')
+
+##########roc
+
+result.prob.cart2 <- predict(test_model_list_no_gender[[1]], indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.cart2 <- roc(indiv_data_validation_var$accept, result.prob.cart1$notaccept) # Draw ROC curve.
+plot(result.roc.cart2,  print.thres.best.method="closest.topleft")
+
+result.coords <- coords(result.roc.cart2, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)
+#0.4701612 0.5968755
+auc(result.roc.cart2)
+#AUC: 0.6243
+#PPV:  0.19933   
+#Predicted accept: 956  238 = 1,194
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.accept <-result.random.validation.info %>% filter(predicted == 1)
+
+#acceptance rate 비교
+count(result.random.validation.accept,sex)
+#female : 1062 / 2268 = 0.468
+#male : 1165  / 4261 = 0.273 -> ,-0.195,
+
+unique_list <- lapply(indiv_data_train_var[,-c(1,17)], unique)
+
+B <- 1e6
+a <- 1:10
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble
+ grid_set$yhat <- predict(test_model_list_no_gender[[1]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##bia of model= 0.000001
+bias_test.male <- bias_test %>% filter(sex=='Male')
+bias_test.female <- bias_test %>% filter(sex=='Female')
+mean(bias_test.male$yhat) - mean(bias_test.female$yhat)
+
+##############nnet################
+
+#AUC, PPV, acceptance ratio difference
+predicted <- predict(test_model_list_no_gender[[3]], indiv_data_validation_var)
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var$id,Observed=indiv_data_validation_var$accept, predicted)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+
+#accuracy for validation set
+result.random.validation <- result.random.validation %>% mutate(Observed  = ifelse(Observed ==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+result.random.validation <- result.random.validation %>% mutate(predicted = ifelse(predicted==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(result.random.validation$predicted ,result.random.validation$Observed, positive = '1')
+
+##########roc
+result.prob.nn <- predict(test_model_list_no_gender[[3]], indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.nn2 <- roc(indiv_data_validation_var$accept, result.prob.nn$notaccept) # Draw ROC curve.
+plot(result.roc.nn2,  print.thres.best.method="closest.topleft")
+result.coords <- coords(result.roc.nn2, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+#0.4479867 0.7307398 
+auc(result.roc.nn2)
+#AUC:  0.7509
+#PPV: 0.13606  
+#Predicted accept: 1924  303 = 2,227,
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data)
+result.random.validation.accept <-result.random.validation.info %>% filter(predicted == 1)
+
+#acceptance rate 비교
+count(result.random.validation.accept,sex)
+#female : 1062 / 2268 = 0.468
+#male : 1165  / 4261 = 0.273 -> ,-0.195,
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble
+ grid_set$yhat <- predict(test_model_list_no_gender[[3]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##bia of model= 0.000001
+bias_test.male <- bias_test %>% filter(sex=='Male')
+bias_test.female <- bias_test %>% filter(sex=='Female')
+mean(bias_test.male$yhat) - mean(bias_test.female$yhat)
+
+
+#To check distortion of rule
+#domestic top 3 & age <= 24 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.4592657,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#1
+
+###################
+######XGboost######
+###################
+
+#AUC, PPV, acceptance ratio difference
+predicted <- predict(test_model_list_no_gender[[4]], indiv_data_validation_var)
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var$id,Observed=indiv_data_validation_var$accept, predicted)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+
+#accuracy for validation set
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+result.random.validation <- result.random.validation %>% mutate(predicted = ifelse(predicted==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(result.random.validation$predicted ,result.random.validation$Observed, positive = '1')
+
+##########roc
+result.prob.xg <- predict(test_model_list_no_gender[[4]], indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.xg2 <- roc(indiv_data_validation_var$accept, result.prob.xg$notaccept) # Draw ROC curve.
+plot(result.roc.xg2,  print.thres.best.method="closest.topleft")
+
+result.coords <- coords(result.roc.xg2, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+#0.5389554 0.7020983 
+auc(result.roc.xg2)
+
+#AUC:  0.7827
+#PPV: 0.16157   
+#Predicted accept:1562  301 = 1,863,
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data)
+result.random.validation.accept <-result.random.validation.info %>% filter(predicted == 1)
+
+#acceptance rate 비교
+
+count(result.random.validation.accept,sex)
+#female : 813 / 2268 = 0.358
+#male : 1050 / 4261 = 0.246  -> -0.112
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble
+ grid_set$yhat <- predict(test_model_list_no_gender[[4]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##bia of model=  0.00001
+bias_test.male <- bias_test %>% filter(sex=='Male')
+bias_test.female <- bias_test %>% filter(sex=='Female')
+mean(bias_test.male$yhat) - mean(bias_test.female$yhat)
+
+#To check distortion of rule
+#domestic top 3 & age <= 24 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.5389554 ,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#1
+###################
+#########rf########
+###################
+
+#AUC, PPV, acceptance ratio difference
+predicted <- predict(test_model_list_no_gender[[5]], indiv_data_validation_var)
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var$id,Observed=indiv_data_validation_var$accept, predicted)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+
+#accuracy for validation set
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+result.random.validation <- result.random.validation %>% mutate(predicted = ifelse(predicted==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(result.random.validation$predicted ,result.random.validation$Observed, positive = '1')
+
+##########roc
+result.prob.rf <- predict(test_model_list_no_gender[[5]], indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.rf2 <- roc(indiv_data_validation_var$accept, result.prob.rf$notaccept) # Draw ROC curve.
+plot(result.roc.rf2,  print.thres.best.method="closest.topleft")
+result.coords <- coords(result.roc.rf2, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+#0.5110000 0.6993414 
+auc(result.roc.rf2)
+#AUC: 0.7566
+#PPV:  0.14398 
+#Predicted accept: 1736  292 = 2,028,
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data)
+result.random.validation.accept <-result.random.validation.info %>% filter(predicted == 1)
+
+#acceptance rate 비교
+count(result.random.validation.accept,sex)
+#female :811 / 2268  = 0.358
+#male : 1217 / 4261 =  0.286 -> -0.072
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble
+ grid_set$yhat <- predict(test_model_list_no_gender[[5]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##bia of model=  0.0001
+bias_test.male <- bias_test %>% filter(sex=='Male')
+bias_test.female <- bias_test %>% filter(sex=='Female')
+mean(bias_test.male$yhat) - mean(bias_test.female$yhat)
+
+#To check distortion of rule
+#domestic top 3 & age <= 24 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.5110000 ,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#0.9982705
+
+############glm############
+##MY: Logistic regression에서는 mean_gpa의 square term이 들어가야 하므로, 해당변수를 넣어 새로 모델을 만들어줌. 
+
+indiv_data_train_var <- indiv_data_train_var %>% mutate(mean_gpa2 = I(mean_gpa^2))
+indiv_data_validation_var <- indiv_data_validation_var %>% mutate(mean_gpa2 = I(mean_gpa^2))
+test_model_list_no_gender[[2]] <- train((accept) ~ .,
+                         data = subset(indiv_data_train_var, select=age:mean_gpa2),
+                         method = "glm",
+                         preProcess = NULL, 
+                         metric = "Accuracy") 
+
+#glm rule
+(test_model_list_no_gender[[2]]$finalModel)
+
+#AUC, PPV, acceptance ratio difference
+predicted <- predict(test_model_list_no_gender[[2]], indiv_data_validation_var)
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var$id,Observed=indiv_data_validation_var$accept, predicted)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+
+#accuracy for validation set
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+result.random.validation <- result.random.validation %>% mutate(predicted = ifelse(predicted==1,0,1))
+result.random.validation <- result.random.validation %>% mutate(predicted = as.factor(predicted))
+
+confusionMatrix(result.random.validation$predicted ,result.random.validation$Observed, positive = '1')
+
+##########roc
+
+result.prob.lg <- predict(test_model_list_no_gender[[2]], indiv_data_validation_var, type="prob") # Prediction
+
+result.roc.lg2 <- roc(indiv_data_validation_var$accept, result.prob.lg$notaccept) # Draw ROC curve.
+plot(result.roc.lg2,  print.thres.best.method="closest.topleft")
+
+result.coords <- coords(result.roc.lg2, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+#0.4870857 0.7174146
+auc(result.roc.lg2)
+#AUC: 0.7722
+#PPV: 0.14907 
+#Predicted accept: 1781  312 =   2,093
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data)
+result.random.validation.accept <-result.random.validation.info %>% filter(predicted == 1)
+
+#acceptance rate 비교
+count(result.random.validation.accept,sex)
+#female : 946 / 2268 = 0.417
+#male : 1147  / 4261 =  0.269 -> -0.148
+
+
+unique_list <- lapply(indiv_data_train_var[,-c(1)], unique)
+
+B <- 1e6
+a <- 1:10
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble
+ grid_set$yhat <- predict(test_model_list_no_gender[[2]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##bia of model= 0.0005
+bias_test.male <- bias_test %>% filter(sex=='Male')
+bias_test.female <- bias_test %>% filter(sex=='Female')
+mean(bias_test.male$yhat) - mean(bias_test.female$yhat)
+
+#To check distortion of rule
+#domestic top 3 & age <= 24 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.4870857 ,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#0.7540702
+ 
+```
+# scenario 3
+```{r bias assessment, message = FALSE}
+# change all validation candidate as male
+indiv_data_validation_var_male <- indiv_data_validation_var %>% mutate(real_gender = sex)
+indiv_data_validation_var_male <- indiv_data_validation_var_male %>% mutate(sex = ifelse(sex=='Female','Male','Male'))
+indiv_data_validation_var_male <- indiv_data_validation_var_male %>% mutate(sex = as.factor(sex))
+
+#CART
+
+result.predicted.prob.tree <- predict(test_model_list[[1]], indiv_data_validation_var_male, type="prob") # Prediction
+
+
+result.roc.cart3<- roc(indiv_data_validation_var_male$accept, result.predicted.prob.tree$notaccept) # Draw ROC curve.
+plot(result.roc.cart1, col = 'black')
+plot(result.roc.cart2, add = TRUE, col = 'red')
+plot(result.roc.cart3, add = TRUE, col = 'blue')
+
+result.coords <- coords(result.roc.cart3, "best",  ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+auc(result.roc.cart3)
+#0.4302
+#threshold  accuracy 
+#                best      best
+#threshold       -Inf       Inf
+#accuracy  0.06785113 0.9321489
+
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var_male$id,Observed=indiv_data_validation_var_male$accept, result.predicted.prob.tree)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+Tree.result.random.validation <- result.random.validation %>% mutate(predicted2 = ifelse(zaccept >=0.00001,1,0 ))
+Tree.result.random.validation <- Tree.result.random.validation %>% mutate(predicted2 = as.factor(predicted2))
+Tree.result.random.validation <- Tree.result.random.validation %>% mutate(Observed = ifelse(Observed == 'zaccept',1,0))
+Tree.result.random.validation <- Tree.result.random.validation %>% mutate(Observed = as.factor(Observed))
+
+confusionMatrix(Tree.result.random.validation$predicted2 ,Tree.result.random.validation$Observed, positive = '1')
+
+#predicted accept: 6086  443
+#Pos Pred Value :0.06785  
+
+colnames(Tree.result.random.validation)[1] <- 'id'
+Tree.result.random.validation.info<- Tree.result.random.validation %>% left_join(indiv_data_validation)
+Tree.result.random.validation.accept <- Tree.result.random.validation.info %>% filter(predicted2 == 1)
+
+#acceptance rate 비교
+count(Tree.result.random.validation.accept,sex)
+#female : 2268/2268 = 
+#male : 4261/4261 =  -> 0
+  
+
+###########################
+############glm############
+###########################
+
+
+result.predicted.prob.lg <- predict(test_model_list[[2]], indiv_data_validation_var_male, type="prob") # Prediction
+
+
+result.roc.lg3<- roc(indiv_data_validation_var_male$accept, result.predicted.prob.lg$notaccept) # Draw ROC curve.
+plot(result.roc.lg1, col = 'black')
+plot(result.roc.lg2, add = TRUE, col = 'red')
+plot(result.roc.lg3, add = TRUE, col = 'blue')
+
+result.coords <- coords(result.roc.lg3, "best",  ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+auc(result.roc.lg3)
+#0.7549
+#0.4015180 0.6648798 
+
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var_male$id,Observed=indiv_data_validation_var_male$accept, result.predicted.prob.lg)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+result.random.validation <- result.random.validation %>% mutate(predicted2 = ifelse(zaccept >=0.4015180,1,0 ))
+result.random.validation <- result.random.validation %>% mutate(predicted2 = as.factor(predicted2))
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed == 'zaccept',1,0))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+
+confusionMatrix(result.random.validation$predicted2 ,result.random.validation$Observed, positive = '1')
+
+#predicted accept: 3401  388 = 3,789,
+#Pos Pred Value : 0.10240     
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data_validation)
+result.random.validation.accept <- result.random.validation.info %>% filter(predicted2 == 1)
+
+#acceptance rate 비교
+count(result.random.validation.accept,sex)
+#female : 1864/2268 = 0.822
+#male : 1925/4261 = 0.452 ->-0.37
+  
+
+
+
+unique_list <- lapply(indiv_data_train_var[,-c(1)], unique)
+
+B <- 1e6
+a <- 1:10
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble %>% mutate(sex =ifelse(sex=='Female','Male','Male'))
+ grid_set$yhat <- predict(test_model_list[[2]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+
+##To check distortion of rule
+#domestic top 3 & age <= 24 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.401,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#0.8724917
+
+
+
+##############nnet################
+
+result.predicted.prob.nn <- predict(test_model_list[[3]], indiv_data_validation_var_male, type="prob") # Prediction
+
+
+result.roc.nn3<- roc(indiv_data_validation_var_male$accept, result.predicted.prob.nn$notaccept) # Draw ROC curve.
+plot(result.roc.nn1, col = 'black')
+plot(result.roc.nn2, add = TRUE, col = 'red')
+plot(result.roc.nn3, add = TRUE, col = 'blue')
+
+result.coords <- coords(result.roc.nn3, "best",  ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+auc(result.roc.nn3)
+#0.75490.754
+#0.3194007 0.6867820
+
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var_male$id,Observed=indiv_data_validation_var_male$accept, result.predicted.prob.nn)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+result.random.validation <- result.random.validation %>% mutate(predicted2 = ifelse(zaccept >=0.3194007,1,0 ))
+result.random.validation <- result.random.validation %>% mutate(predicted2 = as.factor(predicted2))
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed == 'zaccept',1,0))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+
+confusionMatrix(result.random.validation$predicted2 ,result.random.validation$Observed, positive = '1')
+
+#predicted accept: 3707  391 = 4,098,
+#Pos Pred Value : 0.09541      
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data_validation)
+result.random.validation.accept <- result.random.validation.info %>% filter(predicted2 == 1)
+
+#acceptance rate 비교
+count(result.random.validation.accept,sex)
+#female : 1866/2268 = 0.823
+#male : 2232/4261 = 0.524 -> -0.299
+  
+
+unique_list <- lapply(indiv_data_train_var[,-c(1,17)], unique)
+
+B <- 1e6
+a <- 1:10
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble %>% mutate(sex =ifelse(sex=='Female','Male','Male'))
+ grid_set$yhat <- predict(test_model_list[[3]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##To check distortion of rule
+#domestic top 3 & age <= 24 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.3,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#0.9638667
+
+
+###################
+######XGboost######
+###################
+
+result.predicted.prob.xg <- predict(test_model_list[[4]], indiv_data_validation_var_male, type="prob") # Prediction
+
+result.roc.xg3<- roc(indiv_data_validation_var_male$accept, result.predicted.prob.xg$notaccept) # Draw ROC curve.
+plot(result.roc.xg1, col = 'black')
+plot(result.roc.xg2, add = TRUE, col = 'red')
+plot(result.roc.xg3, add = TRUE, col = 'blue')
+
+result.coords <- coords(result.roc.xg3, "best",  ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+auc(result.roc.xg3)
+#0.7623
+#0.4348736 0.6835656
+
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var_male$id,Observed=indiv_data_validation_var_male$accept, result.predicted.prob.xg)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+result.random.validation <- result.random.validation %>% mutate(predicted2 = ifelse(zaccept >=0.4348736,1,0 ))
+result.random.validation <- result.random.validation %>% mutate(predicted2 = as.factor(predicted2))
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed == 'zaccept',1,0))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+
+confusionMatrix(result.random.validation$predicted2 ,result.random.validation$Observed, positive = '1')
+
+#predicted accept: 3241  375 = 3,616,
+#Pos Pred Value : 0.10371       
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data_validation)
+result.random.validation.accept <- result.random.validation.info %>% filter(predicted2 == 1)
+
+#acceptance rate 비교
+count(result.random.validation.accept,sex)
+#female : 1764 / 2323 = 0.759
+#male : 1852 / 4206 =  0.440 -> -0.319
+  
+
+unique_list <- lapply(indiv_data_train_var[,-c(1,17)], unique)
+
+B <- 1e6
+a <- 1:10
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble %>% mutate(sex =ifelse(sex=='Female','Male','Male'))
+ grid_set$yhat <- predict(test_model_list[[4]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##To check distortion of rule
+#domestic top 3 & age <= 24 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.434,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#1
+
+###################
+######rf###########
+###################
+
+result.predicted.prob.rf <- predict(test_model_list[[5]], indiv_data_validation_var_male, type="prob") # Prediction
+
+result.roc.rf3<- roc(indiv_data_validation_var_male$accept, result.predicted.prob.rf$notaccept) # Draw ROC curve.
+plot(result.roc.rf1, col = 'black')
+plot(result.roc.rf2, add = TRUE, col = 'red')
+plot(result.roc.rf3, add = TRUE, col = 'blue')
+
+result.coords <- coords(result.roc.rf3, "best",  ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and auc
+auc(result.roc.rf3)
+# 0.7401
+# 0.425000  0.695206 
+
+result.random.validation <- cbind(Applicant_ID=indiv_data_validation_var_male$id,Observed=indiv_data_validation_var_male$accept, result.predicted.prob.rf)
+
+##confusion matrix
+result.random.validation <- as.data.frame(result.random.validation)
+result.random.validation <- result.random.validation %>% mutate(predicted2 = ifelse(zaccept >= 0.425,1,0 ))
+result.random.validation <- result.random.validation %>% mutate(predicted2 = as.factor(predicted2))
+result.random.validation <- result.random.validation %>% mutate(Observed = ifelse(Observed == 'zaccept',1,0))
+result.random.validation <- result.random.validation %>% mutate(Observed = as.factor(Observed))
+
+confusionMatrix(result.random.validation$predicted2 ,result.random.validation$Observed, positive = '1')
+
+#predicted accept:  3335  373  = 3708
+#Pos Pred Value :  0.10059         
+
+colnames(result.random.validation)[1] <- 'id'
+result.random.validation.info<- result.random.validation %>% left_join(indiv_data_validation)
+result.random.validation.accept <- result.random.validation.info %>% filter(predicted2 == 1)
+
+#acceptance rate 비교
+count(result.random.validation.accept,sex)
+#female :1723 / 2323 = 0.742
+#male : 1985 / 4206 =  0.472 -> -0.27
+  
+
+unique_list <- lapply(indiv_data_train_var[,-c(1,17)], unique)
+
+B <- 1e6
+a <- 1:10
+
+for (k in seq_along(a)){
+ grid_set <- lapply(unique_list, sample, size = B, replace = TRUE) %>% as_tibble %>% mutate(sex =ifelse(sex=='Female','Male','Male'))
+ grid_set$yhat <- predict(test_model_list[[5]], newdata = grid_set, type = "prob")$zaccept
+ grid_set <-grid_set %>% mutate(repeat_n = k)
+ if (k == 1){
+ bias_test <- (grid_set)}
+ if (k > 1) {
+ bias_test_new <- (grid_set)  
+ bias_test <- bias_test %>% rbind(bias_test_new)}
+}
+
+##To check distortion of rule
+#domestic top 3 & age <= 24 & certificate >= 1 & mean_gpa >= 80 <=85 & intern_exp ==TRUE
+result.random.validation.bias.highspec <- bias_test %>% filter(UniversityClass =='Domestic top 3' & age <= 24   & certificate >= 1 & mean_gpa >= 80& mean_gpa <= 85 & intern_exp ==1)
+result.random.validation.bias.highspec <- result.random.validation.bias.highspec %>% mutate(accept = ifelse(yhat >=0.425,1,0))
+mean(result.random.validation.bias.highspec$accept)
+#1
+```
